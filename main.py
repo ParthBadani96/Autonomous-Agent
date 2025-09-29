@@ -208,7 +208,7 @@ def morning_brief_job():
     try:
         # Get leads from last 24 hours
         yesterday_ms = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
-        contacts = get_hubspot_contacts(limit=100)
+        contacts = get_hubspot_contacts(limit=100, properties=['firstname', 'lastname', 'email', 'company', 'createdate'])
         
         # Filter recent contacts with proper date parsing
         recent_contacts = []
@@ -237,7 +237,11 @@ def morning_brief_job():
         open_deals = [d for d in deals if 'closed' not in d.get('properties', {}).get('dealstage', '').lower()]
         
         # Calculate total pipeline value
-        pipeline_value = sum([float(d.get('properties', {}).get('amount', 0)) for d in open_deals])
+        pipeline_value = 0
+        for deal in open_deals:
+            amount = deal.get('properties', {}).get('amount')
+            if amount is not None:
+                pipeline_value += float(amount)
         
         # Analyze with Claude
         analysis = analyze_with_claude(
@@ -298,11 +302,14 @@ def deal_health_check_job():
             
             if 'closed' not in stage.lower() and last_modified_ms < seven_days_ago_ms:
                 days_stalled = (datetime.now().timestamp() * 1000 - last_modified_ms) / (1000 * 60 * 60 * 24)
+                amount = props.get('amount')
+                deal_amount = float(amount) if amount is not None else 0
+                
                 stalled_deals.append({
                     'id': deal['id'],
                     'name': props.get('dealname', 'Unknown'),
                     'stage': stage,
-                    'amount': float(props.get('amount', 0)),
+                    'amount': deal_amount,
                     'days_stalled': int(days_stalled)
                 })
         
@@ -359,7 +366,8 @@ def lead_score_optimizer_job():
     metrics['last_run']['lead_score'] = datetime.now().isoformat()
     
     try:
-        contacts = get_hubspot_contacts(limit=200)
+                
+        contacts = get_hubspot_contacts(limit=200, properties=['firstname', 'lastname', 'email', 'company', 'createdate'])
         deals = get_hubspot_deals(limit=100)
         
         # Analyze high-scoring leads
@@ -774,37 +782,62 @@ def status():
 @app.route('/api/query', methods=['POST'])
 def query():
     """Handle manual queries from dashboard"""
-    question = request.json.get('question', '')
-    
-    if not question:
-        return jsonify({'answer': 'Please provide a question'})
-    
-    log_action('QUERY', f'Manual query: {question[:50]}...', None)
-    
-    # Get current pipeline data
-    contacts = get_hubspot_contacts(limit=100)
-    deals = get_hubspot_deals(limit=100)
-    
-    # Calculate key metrics
-    pipeline_value = sum([float(d.get('properties', {}).get('amount', 0)) for d in deals if 'closed' not in d.get('properties', {}).get('dealstage', '').lower()])
-    high_score_leads = [c for c in contacts if int(c.get('properties', {}).get('lead_score_ml', 0)) >= 80]
-    
-    # Analyze with Claude
-    answer = analyze_with_claude(
-        f"""Hey, someone from the team just asked me: "{question}"
+    try:
+        question = request.json.get('question', '')
         
+        if not question:
+            return jsonify({'answer': 'Please provide a question'})
+        
+        log_action('QUERY', f'Manual query: {question[:50]}...', None)
+        
+        # Get current pipeline data with error handling
+        contacts = []
+        deals = []
+        
+        try:
+            contacts = get_hubspot_contacts(limit=100, properties=['firstname', 'lastname', 'email', 'company', 'createdate'])
+        except Exception as e:
+            log_action('ERROR', f'Failed to fetch contacts: {str(e)}', None)
+        
+        try:
+            deals = get_hubspot_deals(limit=100)
+        except Exception as e:
+            log_action('ERROR', f'Failed to fetch deals: {str(e)}', None)
+        
+        # Calculate key metrics
+        pipeline_value = 0
+        high_score_leads = []
+        
+        try:
+            open_deals = [d for d in deals if 'closed' not in d.get('properties', {}).get('dealstage', '').lower()]
+            for deal in open_deals:
+                amount = deal.get('properties', {}).get('amount')
+                if amount is not None:
+                    pipeline_value += float(amount)
+        except Exception as e:
+            log_action('ERROR', f'Pipeline calculation error: {str(e)}', None)
+        
+        # Analyze with Claude
+        answer = analyze_with_claude(
+            f"""Hey, someone from the team just asked me: "{question}"
+            
 Can you help me answer this based on what's happening in our pipeline right now? Just talk to me like we're colleagues figuring this out together - give me the real talk on what's going on and what they should do about it.""",
-        {
-            'total_contacts': len(contacts),
-            'total_deals': len(deals),
-            'pipeline_value': f'${pipeline_value:,.0f}',
-            'high_score_leads': len(high_score_leads),
-            'contact_samples': contacts[:15],
-            'deal_samples': deals[:15]
-        }
-    )
-    
-    return jsonify({'answer': answer})
+            {
+                'total_contacts': len(contacts),
+                'total_deals': len(deals),
+                'pipeline_value': f'${pipeline_value:,.0f}',
+                'contact_samples': contacts[:15] if contacts else [],
+                'deal_samples': deals[:15] if deals else []
+            }
+        )
+        
+        return jsonify({'answer': answer})
+        
+    except Exception as e:
+        error_msg = f"Query failed: {str(e)}"
+        log_action('ERROR', error_msg, None)
+        return jsonify({'answer': f"I ran into an issue: {error_msg}\n\nPlease check the Railway logs for details."})
+
 
 @app.route('/api/trigger/<job_name>', methods=['POST'])
 def trigger_job(job_name):
@@ -833,7 +866,7 @@ def weekly_report():
     try:
         week_ago_ms = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
         
-        contacts = get_hubspot_contacts(limit=300)
+        contacts = get_hubspot_contacts(limit=300, properties=['firstname', 'lastname', 'email', 'company', 'createdate'])
         deals = get_hubspot_deals(limit=150)
         
         # Filter weekly leads with proper date parsing
@@ -854,7 +887,11 @@ def weekly_report():
         weekly_closed = [d for d in deals if 'closed' in d.get('properties', {}).get('dealstage', '').lower()]
         
         won_deals = [d for d in weekly_closed if 'won' in d.get('properties', {}).get('dealstage', '').lower()]
-        revenue = sum([float(d.get('properties', {}).get('amount', 0)) for d in won_deals])
+        revenue = 0
+        for deal in won_deals:
+            amount = deal.get('properties', {}).get('amount')
+            if amount is not None:
+                revenue += float(amount)
         
         report_content = f"""
 GTM WEEKLY REPORT
@@ -1008,27 +1045,33 @@ def start_scheduler():
 # ===== APPLICATION STARTUP =====
 
 if __name__ == '__main__':
-    print("\n" + "="*70)
-    print("GTM AUTONOMOUS AGENT v2 - PRODUCTION")
-    print("="*70)
-    print(f"Dashboard: http://localhost:5000")
-    print(f"Health Check: http://localhost:5000/health")
-    print("\nScheduled Jobs:")
-    print("  • Morning Brief: Daily at 8:00 AM")
-    print("  • Deal Health Check: Every 4 hours")
-    print("  • Lead Score Optimizer: Daily at 11:00 PM")
-    print("  • Weekly Report: Monday at 9:00 AM")
-    print("\nConfiguration:")
-    print(f"  • Anthropic: {'✓ Configured' if anthropic_client else '✗ Not configured'}")
-    print(f"  • HubSpot: {'✓ Configured' if HUBSPOT_TOKEN else '✗ Not configured'}")
-    print(f"  • Slack: {'✓ Configured' if SLACK_WEBHOOK_URL else '✗ Not configured'}")
-    print("="*70 + "\n")
-    
-    log_action('STARTUP', 'GTM Autonomous Agent v2 started successfully', None)
-    
-    # Start the scheduler
-    scheduler = start_scheduler()
-    
-    # Run Flask app
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    try:
+        print("\n" + "="*70)
+        print("GTM AUTONOMOUS AGENT v2 - PRODUCTION")
+        print("="*70)
+        print(f"Dashboard: http://localhost:5000")
+        print(f"Health Check: http://localhost:5000/health")
+        print("\nScheduled Jobs:")
+        print("  • Morning Brief: Daily at 8:00 AM")
+        print("  • Deal Health Check: Every 4 hours")
+        print("  • Lead Score Optimizer: Daily at 11:00 PM")
+        print("  • Weekly Report: Monday at 9:00 AM")
+        print("\nConfiguration:")
+        print(f"  • Anthropic: {'✓ Configured' if anthropic_client else '✗ Not configured'}")
+        print(f"  • HubSpot: {'✓ Configured' if HUBSPOT_TOKEN else '✗ Not configured'}")
+        print(f"  • Slack: {'✓ Configured' if SLACK_WEBHOOK_URL else '✗ Not configured'}")
+        print("="*70 + "\n")
+        
+        log_action('STARTUP', 'GTM Autonomous Agent v2 started successfully', None)
+        
+        # Start the scheduler
+        scheduler = start_scheduler()
+        
+        # Run Flask app
+        port = int(os.environ.get('PORT', 5000))
+        app.run(host='0.0.0.0', port=port, debug=False)
+        
+    except Exception as e:
+        print(f"FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
