@@ -399,13 +399,21 @@ DASHBOARD_HTML = """
             cursor: pointer;
             transition: transform 0.2s;
         }
-        .query-button:hover { transform: translateY(-2px); }
+        .query-button:hover:not(:disabled) { transform: translateY(-2px); }
+        .query-button:disabled { 
+            opacity: 0.6; 
+            cursor: not-allowed;
+        }
         .query-result {
             margin-top: 20px;
             padding: 20px;
             background: #f9fafb;
             border-radius: 10px;
             white-space: pre-wrap;
+            display: none;
+        }
+        .query-result.show {
+            display: block;
         }
     </style>
     <script>
@@ -431,16 +439,35 @@ DASHBOARD_HTML = """
         async function askAgent() {
             const question = document.getElementById('query-input').value;
             const resultDiv = document.getElementById('query-result');
-            resultDiv.textContent = 'Analyzing...';
+            const button = document.querySelector('.query-button');
             
-            const response = await fetch('/api/query', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({question})
-            });
+            if (!question.trim()) {
+                alert('Please enter a question');
+                return;
+            }
             
-            const data = await response.json();
-            resultDiv.textContent = data.answer;
+            // Show loading state
+            resultDiv.style.display = 'block';
+            resultDiv.classList.add('show');
+            resultDiv.textContent = 'Analyzing your pipeline...';
+            button.disabled = true;
+            button.textContent = 'Analyzing...';
+            
+            try {
+                const response = await fetch('/api/query', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({question})
+                });
+                
+                const data = await response.json();
+                resultDiv.textContent = data.answer || 'No response received';
+            } catch (error) {
+                resultDiv.textContent = 'Error: ' + error.message;
+            } finally {
+                button.disabled = false;
+                button.textContent = 'Analyze';
+            }
         }
         
         setInterval(refreshData, 5000);
