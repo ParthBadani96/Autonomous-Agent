@@ -172,13 +172,17 @@ def analyze_with_claude(prompt, context_data):
         if not anthropic_client:
             return "Claude analysis unavailable - API key not configured or initialization failed."
         
-        # Add current date context
+        # Add current date context and conversational style
         enhanced_prompt = f"""Current date: {datetime.now().strftime('%B %d, %Y')}
+
+You're a friendly GTM analyst having a conversation with a colleague. Be conversational, natural, and helpful - like you're chatting over coffee, not writing a formal report. Use contractions, casual language, and a warm tone. Skip the formality and bullet points unless specifically asked for lists.
 
 {prompt}
 
 Context Data:
-{json.dumps(context_data, indent=2)}"""
+{json.dumps(context_data, indent=2)}
+
+Respond naturally as if talking to a teammate, giving practical advice in a conversational way."""
         
         message = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
@@ -205,10 +209,25 @@ def morning_brief_job():
         yesterday_ms = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
         contacts = get_hubspot_contacts(limit=100)
         
-        recent_contacts = [
-            c for c in contacts 
-            if int(c.get('properties', {}).get('createdate', '0')) > yesterday_ms
-        ]
+        # Filter recent contacts with proper date parsing
+        recent_contacts = []
+        for c in contacts:
+            createdate = c.get('properties', {}).get('createdate', '0')
+            try:
+                # Handle both timestamp and ISO format
+                if isinstance(createdate, str) and 'T' in createdate:
+                    # ISO format - convert to timestamp
+                    dt = datetime.fromisoformat(createdate.replace('Z', '+00:00'))
+                    createdate_ms = int(dt.timestamp() * 1000)
+                else:
+                    # Numeric timestamp
+                    createdate_ms = int(createdate)
+                
+                if createdate_ms > yesterday_ms:
+                    recent_contacts.append(c)
+            except (ValueError, TypeError):
+                # Skip contacts with invalid dates
+                continue
         
         metrics['leads_analyzed'] += len(contacts)
         
@@ -269,10 +288,20 @@ def deal_health_check_job():
         for deal in deals:
             props = deal.get('properties', {})
             stage = props.get('dealstage', '')
-            last_modified = int(props.get('hs_lastmodifieddate', '0'))
+            last_modified = props.get('hs_lastmodifieddate', '0')
             
-            if 'closed' not in stage.lower() and last_modified < seven_days_ago_ms:
-                days_stalled = (datetime.now().timestamp() * 1000 - last_modified) / (1000 * 60 * 60 * 24)
+            # Parse last modified date
+            try:
+                if isinstance(last_modified, str) and 'T' in last_modified:
+                    dt = datetime.fromisoformat(last_modified.replace('Z', '+00:00'))
+                    last_modified_ms = int(dt.timestamp() * 1000)
+                else:
+                    last_modified_ms = int(last_modified)
+            except (ValueError, TypeError):
+                continue
+            
+            if 'closed' not in stage.lower() and last_modified_ms < seven_days_ago_ms:
+                days_stalled = (datetime.now().timestamp() * 1000 - last_modified_ms) / (1000 * 60 * 60 * 24)
                 stalled_deals.append({
                     'id': deal['id'],
                     'name': props.get('dealname', 'Unknown'),
@@ -386,7 +415,21 @@ def generate_weekly_report():
         contacts = get_hubspot_contacts(limit=200)
         deals = get_hubspot_deals(limit=100)
         
-        weekly_leads = [c for c in contacts if int(c.get('properties', {}).get('createdate', '0')) > week_ago_ms]
+        # Filter weekly leads with proper date parsing
+        weekly_leads = []
+        for c in contacts:
+            createdate = c.get('properties', {}).get('createdate', '0')
+            try:
+                if isinstance(createdate, str) and 'T' in createdate:
+                    dt = datetime.fromisoformat(createdate.replace('Z', '+00:00'))
+                    createdate_ms = int(dt.timestamp() * 1000)
+                else:
+                    createdate_ms = int(createdate)
+                
+                if createdate_ms > week_ago_ms:
+                    weekly_leads.append(c)
+            except (ValueError, TypeError):
+                continue
         weekly_closed = [d for d in deals if 'closed' in d.get('properties', {}).get('dealstage', '').lower()]
         
         revenue = sum([float(d.get('properties', {}).get('amount', 0)) for d in weekly_closed if 'won' in d.get('properties', {}).get('dealstage', '').lower()])
@@ -806,7 +849,21 @@ def weekly_report():
         contacts = get_hubspot_contacts(limit=300)
         deals = get_hubspot_deals(limit=150)
         
-        weekly_leads = [c for c in contacts if int(c.get('properties', {}).get('createdate', '0')) > week_ago_ms]
+        # Filter weekly leads with proper date parsing
+        weekly_leads = []
+        for c in contacts:
+            createdate = c.get('properties', {}).get('createdate', '0')
+            try:
+                if isinstance(createdate, str) and 'T' in createdate:
+                    dt = datetime.fromisoformat(createdate.replace('Z', '+00:00'))
+                    createdate_ms = int(dt.timestamp() * 1000)
+                else:
+                    createdate_ms = int(createdate)
+                
+                if createdate_ms > week_ago_ms:
+                    weekly_leads.append(c)
+            except (ValueError, TypeError):
+                continue
         weekly_closed = [d for d in deals if 'closed' in d.get('properties', {}).get('dealstage', '').lower()]
         
         won_deals = [d for d in weekly_closed if 'won' in d.get('properties', {}).get('dealstage', '').lower()]
