@@ -19,7 +19,12 @@ SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 RAILWAY_API_URL = os.environ.get('RAILWAY_API_URL', 'http://localhost:3000')
 
 app = Flask(__name__)
-anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+# Initialize Anthropic client with error handling
+try:
+    anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+except Exception as e:
+    print(f"Warning: Could not initialize Anthropic client: {e}")
+    anthropic_client = None
 
 # Store agent actions for dashboard
 agent_log = []
