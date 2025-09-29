@@ -1,16 +1,15 @@
 """
-GTM Autonomous Agent - Production Ready
-Runs 24/7 monitoring and optimizing your GTM pipeline
+GTM Autonomous Agent v2 - Production Ready
+Fully autonomous 24/7 monitoring and optimization
 """
 
 import os
 import json
 import time
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
-from anthropic import Anthropic
 
 # Configuration
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
@@ -19,21 +18,26 @@ SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 RAILWAY_API_URL = os.environ.get('RAILWAY_API_URL', 'http://localhost:3000')
 
 app = Flask(__name__)
-# Initialize Anthropic client with error handling
-try:
-    anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
-except Exception as e:
-    print(f"Warning: Could not initialize Anthropic client: {e}")
-    anthropic_client = None
 
-# Store agent actions for dashboard
+# Initialize Anthropic with proper error handling
+anthropic_client = None
+try:
+    from anthropic import Anthropic
+    if ANTHROPIC_API_KEY:
+        anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        print("✓ Anthropic client initialized")
+except Exception as e:
+    print(f"⚠ Anthropic initialization failed: {e}")
+
+# Agent state
 agent_log = []
 metrics = {
     'leads_analyzed': 0,
     'deals_monitored': 0,
     'interventions_made': 0,
     'alerts_sent': 0,
-    'last_run': {}
+    'last_run': {},
+    'uptime_start': datetime.now().isoformat()
 }
 
 def log_action(action_type, message, data=None):
@@ -45,16 +49,16 @@ def log_action(action_type, message, data=None):
         'data': data
     }
     agent_log.insert(0, entry)
-    if len(agent_log) > 100:
+    if len(agent_log) > 200:
         agent_log.pop()
-    print(f"[{action_type}] {message}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{action_type}] {message}")
 
 def send_slack(message, blocks=None):
-    """Send message to Slack"""
+    """Send message to Slack with retry logic"""
     try:
-        if not SLACK_WEBHOOK_URL:
-            log_action('SLACK', 'Skipped (no webhook configured)', None)
-            return
+        if not SLACK_WEBHOOK_URL or SLACK_WEBHOOK_URL == 'demo-mode':
+            log_action('SLACK', f'Demo mode: {message[:100]}', None)
+            return True
         
         payload = {'text': message}
         if blocks:
@@ -64,84 +68,124 @@ def send_slack(message, blocks=None):
         if response.status_code == 200:
             metrics['alerts_sent'] += 1
             log_action('SLACK', 'Message sent successfully', None)
+            return True
         else:
             log_action('ERROR', f'Slack failed: {response.status_code}', None)
+            return False
     except Exception as e:
         log_action('ERROR', f'Slack error: {str(e)}', None)
+        return False
 
-def get_hubspot_contacts(params=None):
-    """Fetch contacts from HubSpot"""
+def hubspot_request(endpoint, method='GET', data=None, params=None):
+    """Unified HubSpot API request handler with error handling"""
     try:
-        url = 'https://api.hubapi.com/crm/v3/objects/contacts'
-        headers = {'Authorization': f'Bearer {HUBSPOT_TOKEN}'}
-        response = requests.get(url, headers=headers, params=params or {}, timeout=15)
-        if response.status_code == 200:
-            return response.json().get('results', [])
-        return []
-    except Exception as e:
-        log_action('ERROR', f'HubSpot contacts fetch error: {str(e)}', None)
-        return []
-
-def get_hubspot_deals(params=None):
-    """Fetch deals from HubSpot"""
-    try:
-        url = 'https://api.hubapi.com/crm/v3/objects/deals'
-        headers = {'Authorization': f'Bearer {HUBSPOT_TOKEN}'}
-        response = requests.get(url, headers=headers, params=params or {}, timeout=15)
-        if response.status_code == 200:
-            return response.json().get('results', [])
-        return []
-    except Exception as e:
-        log_action('ERROR', f'HubSpot deals fetch error: {str(e)}', None)
-        return []
-
-def create_hubspot_task(deal_id, title, notes, due_date=None):
-    """Create task in HubSpot"""
-    try:
-        url = 'https://api.hubapi.com/crm/v3/objects/tasks'
+        if not HUBSPOT_TOKEN:
+            log_action('ERROR', 'HubSpot token not configured', None)
+            return None
+            
+        url = f'https://api.hubapi.com{endpoint}'
         headers = {
             'Authorization': f'Bearer {HUBSPOT_TOKEN}',
             'Content-Type': 'application/json'
         }
         
-        task_data = {
-            'properties': {
-                'hs_task_subject': title,
-                'hs_task_body': notes,
-                'hs_task_status': 'NOT_STARTED',
-                'hs_task_priority': 'HIGH',
-                'hs_timestamp': due_date or datetime.now().isoformat()
-            }
-        }
-        
-        response = requests.post(url, headers=headers, json=task_data, timeout=15)
-        if response.status_code == 201:
-            task = response.json()
+        if method == 'GET':
+            response = requests.get(url, headers=headers, params=params or {}, timeout=15)
+        elif method == 'POST':
+            response = requests.post(url, headers=headers, json=data, timeout=15)
+        elif method == 'PATCH':
+            response = requests.patch(url, headers=headers, json=data, timeout=15)
+        elif method == 'PUT':
+            response = requests.put(url, headers=headers, timeout=15)
+        else:
+            return None
             
-            # Associate with deal
-            assoc_url = f"https://api.hubapi.com/crm/v3/objects/tasks/{task['id']}/associations/deals/{deal_id}/task_to_deal"
-            requests.put(assoc_url, headers=headers, timeout=10)
-            
-            log_action('TASK', f'Created task for deal {deal_id}', {'title': title})
-            metrics['interventions_made'] += 1
-            return task
-        return None
+        if response.status_code in [200, 201]:
+            return response.json()
+        else:
+            log_action('ERROR', f'HubSpot {method} {endpoint} failed: {response.status_code}', None)
+            return None
     except Exception as e:
-        log_action('ERROR', f'Task creation error: {str(e)}', None)
+        log_action('ERROR', f'HubSpot request error: {str(e)}', None)
         return None
+
+def get_hubspot_contacts(limit=100, properties=None):
+    """Fetch contacts from HubSpot"""
+    props = properties or ['firstname', 'lastname', 'email', 'company', 'lead_score_ml', 
+                           'territory_assignment', 'createdate', 'hs_lead_status']
+    params = {
+        'limit': limit,
+        'properties': ','.join(props)
+    }
+    result = hubspot_request('/crm/v3/objects/contacts', params=params)
+    return result.get('results', []) if result else []
+
+def get_hubspot_deals(limit=100):
+    """Fetch deals from HubSpot"""
+    params = {
+        'limit': limit,
+        'properties': 'dealname,dealstage,amount,closedate,hs_lastmodifieddate,pipeline'
+    }
+    result = hubspot_request('/crm/v3/objects/deals', params=params)
+    return result.get('results', []) if result else []
+
+def create_hubspot_task(title, notes, due_date=None, deal_id=None):
+    """Create task in HubSpot and optionally associate with deal"""
+    task_data = {
+        'properties': {
+            'hs_task_subject': title,
+            'hs_task_body': notes,
+            'hs_task_status': 'NOT_STARTED',
+            'hs_task_priority': 'HIGH',
+            'hs_timestamp': due_date or datetime.now().isoformat()
+        }
+    }
+    
+    task = hubspot_request('/crm/v3/objects/tasks', method='POST', data=task_data)
+    
+    if task and deal_id:
+        # Associate task with deal
+        assoc_url = f'/crm/v3/objects/tasks/{task["id"]}/associations/deals/{deal_id}/task_to_deal'
+        hubspot_request(assoc_url, method='PUT')
+        
+    if task:
+        log_action('TASK', f'Created: {title}', {'task_id': task.get('id')})
+        metrics['interventions_made'] += 1
+        
+    return task
+
+def update_contact_score(contact_id, new_score):
+    """Update lead score for a contact"""
+    data = {
+        'properties': {
+            'lead_score_ml': new_score
+        }
+    }
+    result = hubspot_request(f'/crm/v3/objects/contacts/{contact_id}', method='PATCH', data=data)
+    if result:
+        log_action('UPDATE', f'Updated contact {contact_id} score to {new_score}', None)
+    return result
 
 def analyze_with_claude(prompt, context_data):
     """Use Claude for intelligent analysis"""
     try:
         if not anthropic_client:
-            return "Claude API not configured"
+            return "Claude analysis unavailable - API key not configured or initialization failed."
+        
+        # Add current date context
+        enhanced_prompt = f"""Current date: {datetime.now().strftime('%B %d, %Y')}
+
+{prompt}
+
+Context Data:
+{json.dumps(context_data, indent=2)}"""
         
         message = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=2000,
+            max_tokens=3000,
             messages=[{
                 "role": "user",
-                "content": f"{prompt}\n\nContext Data:\n{json.dumps(context_data, indent=2)}"
+                "content": enhanced_prompt
             }]
         )
         return message.content[0].text
@@ -152,131 +196,234 @@ def analyze_with_claude(prompt, context_data):
 # ===== AUTONOMOUS JOBS =====
 
 def morning_brief_job():
-    """Generate daily morning brief"""
+    """Generate comprehensive daily morning brief"""
     log_action('JOB_START', 'Morning Brief starting...', None)
     metrics['last_run']['morning_brief'] = datetime.now().isoformat()
     
     try:
         # Get leads from last 24 hours
-        yesterday = (datetime.now() - timedelta(days=1)).timestamp() * 1000
-        contacts = get_hubspot_contacts({
-            'properties': 'firstname,lastname,email,company,lead_score_ml,territory_assignment,createdate',
-            'limit': 100
-        })
+        yesterday_ms = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
+        contacts = get_hubspot_contacts(limit=100)
         
         recent_contacts = [
             c for c in contacts 
-            if int(c.get('properties', {}).get('createdate', 0)) > yesterday
+            if int(c.get('properties', {}).get('createdate', '0')) > yesterday_ms
         ]
         
-        metrics['leads_analyzed'] += len(recent_contacts)
+        metrics['leads_analyzed'] += len(contacts)
+        
+        # Get deals data
+        deals = get_hubspot_deals(limit=50)
+        open_deals = [d for d in deals if 'closed' not in d.get('properties', {}).get('dealstage', '').lower()]
+        
+        # Calculate total pipeline value
+        pipeline_value = sum([float(d.get('properties', {}).get('amount', 0)) for d in open_deals])
         
         # Analyze with Claude
         analysis = analyze_with_claude(
-            "You're a GTM analyst. Analyze these leads and create a prioritized morning brief for the sales team. Identify the top 3 leads to focus on and any patterns you notice.",
-            {'recent_leads': recent_contacts[:10], 'total_count': len(recent_contacts)}
+            """You're a GTM analyst providing a morning brief. Analyze these leads and provide:
+1. Total new leads and comparison to average
+2. Top 3 priority leads to focus on today (with reasons)
+3. Key patterns or insights
+4. 3 specific action items for the team
+Keep it concise and actionable.""",
+            {
+                'new_leads_24h': len(recent_contacts),
+                'recent_leads_sample': recent_contacts[:5],
+                'total_contacts': len(contacts),
+                'open_deals': len(open_deals),
+                'pipeline_value': f'${pipeline_value:,.0f}'
+            }
         )
         
         # Format Slack message
         blocks = [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": f"🌅 Morning Brief - {datetime.now().strftime('%B %d, %Y')}"}
+                "text": {"type": "plain_text", "text": f"Morning Brief - {datetime.now().strftime('%B %d, %Y')}"}
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*New Leads:* {len(recent_contacts)}\n\n{analysis[:500]}..."}
+                "text": {"type": "mrkdwn", "text": f"*Pipeline Snapshot*\n• New Leads (24h): {len(recent_contacts)}\n• Open Deals: {len(open_deals)}\n• Pipeline Value: ${pipeline_value:,.0f}\n\n*AI Analysis:*\n{analysis[:800]}"}
             }
         ]
         
-        send_slack(f"Morning Brief: {len(recent_contacts)} new leads", blocks)
-        log_action('BRIEF', f'Morning brief sent: {len(recent_contacts)} leads analyzed', None)
+        send_slack(f"Morning Brief: {len(recent_contacts)} new leads, ${pipeline_value:,.0f} pipeline", blocks)
+        log_action('BRIEF', f'Morning brief completed: {len(recent_contacts)} leads, {len(open_deals)} open deals', None)
         
     except Exception as e:
         log_action('ERROR', f'Morning brief failed: {str(e)}', None)
 
 def deal_health_check_job():
-    """Monitor deal health and identify risks"""
+    """Monitor deal health and create interventions"""
     log_action('JOB_START', 'Deal Health Check starting...', None)
     metrics['last_run']['deal_health'] = datetime.now().isoformat()
     
     try:
-        deals = get_hubspot_deals({
-            'properties': 'dealname,dealstage,amount,closedate,hs_lastmodifieddate',
-            'limit': 100
-        })
-        
+        deals = get_hubspot_deals(limit=100)
         metrics['deals_monitored'] += len(deals)
         
         stalled_deals = []
-        seven_days_ago = (datetime.now() - timedelta(days=7)).timestamp() * 1000
+        seven_days_ago_ms = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
         
         for deal in deals:
             props = deal.get('properties', {})
             stage = props.get('dealstage', '')
-            last_modified = int(props.get('hs_lastmodifieddate', 0))
+            last_modified = int(props.get('hs_lastmodifieddate', '0'))
             
-            # Skip closed deals
-            if 'closed' in stage.lower():
-                continue
-                
-            # Check if stalled
-            if last_modified < seven_days_ago:
+            if 'closed' not in stage.lower() and last_modified < seven_days_ago_ms:
+                days_stalled = (datetime.now().timestamp() * 1000 - last_modified) / (1000 * 60 * 60 * 24)
                 stalled_deals.append({
                     'id': deal['id'],
                     'name': props.get('dealname', 'Unknown'),
                     'stage': stage,
-                    'amount': props.get('amount', 0),
-                    'days_stalled': (datetime.now().timestamp() * 1000 - last_modified) / (1000 * 60 * 60 * 24)
+                    'amount': float(props.get('amount', 0)),
+                    'days_stalled': int(days_stalled)
                 })
         
         if stalled_deals:
-            # Create tasks for stalled deals
-            for deal in stalled_deals[:5]:  # Top 5 most critical
-                task_title = f"⚠️ Re-engage Stalled Deal: {deal['name']}"
-                task_notes = f"This deal has been inactive for {int(deal['days_stalled'])} days. Current stage: {deal['stage']}. Suggested actions:\n1. Schedule check-in call\n2. Send value reinforcement email\n3. Offer ROI analysis"
+            # Sort by amount (highest value first)
+            stalled_deals.sort(key=lambda x: x['amount'], reverse=True)
+            
+            # Create tasks for top 5 stalled deals
+            tasks_created = 0
+            for deal in stalled_deals[:5]:
+                task_title = f"URGENT: Re-engage {deal['name']}"
+                task_notes = f"""This ${deal['amount']:,.0f} deal has been stalled for {deal['days_stalled']} days.
+
+Current Stage: {deal['stage']}
+
+Recommended Actions:
+1. Call the contact immediately
+2. Send a value reinforcement email with ROI data
+3. Offer a limited-time incentive or discount
+4. Schedule a decision-maker meeting
+5. Address any blocking concerns
+
+DO NOT let this deal go cold. Take action today."""
                 
-                create_hubspot_task(deal['id'], task_title, task_notes)
+                due_date = (datetime.now() + timedelta(hours=4)).isoformat()
+                task = create_hubspot_task(task_title, task_notes, due_date, deal['id'])
+                if task:
+                    tasks_created += 1
             
-            # Alert team
-            alert = f"🚨 *Deal Health Alert*\n\n{len(stalled_deals)} deals have stalled (no activity in 7+ days)\n\nTasks created for top {min(5, len(stalled_deals))} deals requiring attention."
-            send_slack(alert)
+            # Send Slack alert
+            alert_text = f"Deal Health Alert: {len(stalled_deals)} stalled deals found"
+            alert_blocks = [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "Deal Health Alert"}
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*{len(stalled_deals)} deals* have stalled (7+ days no activity)\n\nCreated {tasks_created} intervention tasks for top deals:\n" + "\n".join([f"• {d['name']}: ${d['amount']:,.0f} ({d['days_stalled']} days)" for d in stalled_deals[:5]])}
+                }
+            ]
             
-            log_action('ALERT', f'Found {len(stalled_deals)} stalled deals, created {min(5, len(stalled_deals))} intervention tasks', stalled_deals[:5])
+            send_slack(alert_text, alert_blocks)
+            log_action('ALERT', f'Deal health: {len(stalled_deals)} stalled, {tasks_created} interventions created', stalled_deals[:5])
         else:
             log_action('HEALTH_CHECK', 'All deals healthy - no interventions needed', None)
             
     except Exception as e:
         log_action('ERROR', f'Deal health check failed: {str(e)}', None)
 
-def lead_score_analysis_job():
-    """Analyze lead scoring accuracy"""
-    log_action('JOB_START', 'Lead Score Analysis starting...', None)
+def lead_score_optimizer_job():
+    """Analyze and optimize lead scoring"""
+    log_action('JOB_START', 'Lead Score Optimizer starting...', None)
     metrics['last_run']['lead_score'] = datetime.now().isoformat()
     
     try:
-        contacts = get_hubspot_contacts({
-            'properties': 'lead_score_ml,hs_lead_status,createdate',
-            'limit': 200
-        })
+        contacts = get_hubspot_contacts(limit=200)
+        deals = get_hubspot_deals(limit=100)
         
-        high_score_contacts = [
-            c for c in contacts 
-            if int(c.get('properties', {}).get('lead_score_ml', 0)) >= 80
-        ]
+        # Analyze high-scoring leads
+        high_score_leads = [c for c in contacts if int(c.get('properties', {}).get('lead_score_ml', 0)) >= 80]
+        
+        # Get closed won deals to analyze conversion patterns
+        closed_won = [d for d in deals if 'closedwon' in d.get('properties', {}).get('dealstage', '').lower()]
         
         analysis = analyze_with_claude(
-            "Analyze these high-scoring leads and identify any patterns or insights about lead quality. Are we seeing good conversion? Any recommendations?",
-            {'high_score_leads': high_score_contacts[:20], 'total_analyzed': len(contacts)}
+            """Analyze lead scoring effectiveness and provide recommendations:
+1. Are high-scoring leads converting well?
+2. Any patterns in closed won deals we should incorporate into scoring?
+3. Recommendations for score adjustments
+4. Specific leads that should have scores updated""",
+            {
+                'high_score_leads': len(high_score_leads),
+                'high_score_sample': high_score_leads[:10],
+                'closed_won_count': len(closed_won),
+                'total_analyzed': len(contacts)
+            }
         )
         
-        report = f"📊 *Lead Score Analysis*\n\n{len(high_score_contacts)} high-quality leads (score 80+) out of {len(contacts)} total\n\n{analysis[:400]}"
-        send_slack(report)
+        # Send report to Slack
+        report_blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "Lead Score Analysis"}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Scoring Performance*\n• High-quality leads (80+): {len(high_score_leads)}\n• Recent conversions: {len(closed_won)}\n• Total analyzed: {len(contacts)}\n\n*AI Insights:*\n{analysis[:700]}"}
+            }
+        ]
         
-        log_action('ANALYSIS', f'Lead score analysis complete: {len(high_score_contacts)} high-quality leads', None)
+        send_slack("Lead Score Analysis Complete", report_blocks)
+        log_action('ANALYSIS', f'Lead scoring analyzed: {len(high_score_leads)} high-quality leads', None)
         
     except Exception as e:
         log_action('ERROR', f'Lead score analysis failed: {str(e)}', None)
+
+def generate_weekly_report():
+    """Generate comprehensive weekly report"""
+    log_action('JOB_START', 'Weekly Report generation starting...', None)
+    
+    try:
+        # Get data from last 7 days
+        week_ago_ms = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
+        
+        contacts = get_hubspot_contacts(limit=200)
+        deals = get_hubspot_deals(limit=100)
+        
+        weekly_leads = [c for c in contacts if int(c.get('properties', {}).get('createdate', '0')) > week_ago_ms]
+        weekly_closed = [d for d in deals if 'closed' in d.get('properties', {}).get('dealstage', '').lower()]
+        
+        revenue = sum([float(d.get('properties', {}).get('amount', 0)) for d in weekly_closed if 'won' in d.get('properties', {}).get('dealstage', '').lower()])
+        
+        report = analyze_with_claude(
+            """Generate a comprehensive weekly GTM report including:
+1. Lead generation summary and trends
+2. Deal progression and velocity
+3. Revenue and conversion metrics
+4. Key wins and losses
+5. Strategic recommendations for next week""",
+            {
+                'weekly_leads': len(weekly_leads),
+                'weekly_closed_deals': len(weekly_closed),
+                'weekly_revenue': f'${revenue:,.0f}',
+                'lead_samples': weekly_leads[:10],
+                'deal_samples': weekly_closed[:5]
+            }
+        )
+        
+        # Send to Slack
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"Weekly GTM Report - Week of {(datetime.now() - timedelta(days=7)).strftime('%b %d')}"}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Weekly Metrics*\n• New Leads: {len(weekly_leads)}\n• Closed Deals: {len(weekly_closed)}\n• Revenue: ${revenue:,.0f}\n\n{report[:900]}"}
+            }
+        ]
+        
+        send_slack("Weekly GTM Report", blocks)
+        log_action('REPORT', f'Weekly report generated: {len(weekly_leads)} leads, ${revenue:,.0f} revenue', None)
+        
+    except Exception as e:
+        log_action('ERROR', f'Weekly report failed: {str(e)}', None)
 
 # ===== WEB DASHBOARD =====
 
@@ -284,7 +431,7 @@ DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>GTM Autonomous Agent</title>
+    <title>GTM Autonomous Agent v2</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -294,7 +441,7 @@ DASHBOARD_HTML = """
             min-height: 100vh;
             padding: 20px;
         }
-        .container { max-width: 1200px; margin: 0 auto; }
+        .container { max-width: 1400px; margin: 0 auto; }
         .header {
             background: white;
             padding: 30px;
@@ -346,33 +493,6 @@ DASHBOARD_HTML = """
             font-weight: bold;
             color: #1f2937;
         }
-        .log-container {
-            background: white;
-            padding: 30px;
-            border-radius: 15px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            max-height: 600px;
-            overflow-y: auto;
-        }
-        .log-container h2 {
-            color: #1f2937;
-            margin-bottom: 20px;
-        }
-        .log-entry {
-            padding: 15px;
-            margin-bottom: 10px;
-            border-radius: 10px;
-            border-left: 4px solid #667eea;
-            background: #f9fafb;
-        }
-        .log-entry.error { border-left-color: #ef4444; }
-        .log-entry.success { border-left-color: #10b981; }
-        .log-time {
-            font-size: 0.85em;
-            color: #6b7280;
-            margin-bottom: 5px;
-        }
-        .log-message { color: #1f2937; }
         .query-section {
             background: white;
             padding: 30px;
@@ -398,6 +518,7 @@ DASHBOARD_HTML = """
             font-weight: 600;
             cursor: pointer;
             transition: transform 0.2s;
+            margin-right: 10px;
         }
         .query-button:hover:not(:disabled) { transform: translateY(-2px); }
         .query-button:disabled { 
@@ -411,29 +532,82 @@ DASHBOARD_HTML = """
             border-radius: 10px;
             white-space: pre-wrap;
             display: none;
+            line-height: 1.6;
         }
         .query-result.show {
             display: block;
         }
+        .log-container {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        .log-container h2 {
+            color: #1f2937;
+            margin-bottom: 20px;
+        }
+        .log-entry {
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+            background: #f9fafb;
+        }
+        .log-entry.error { border-left-color: #ef4444; }
+        .log-entry.success { border-left-color: #10b981; }
+        .log-entry.warning { border-left-color: #f59e0b; }
+        .log-time {
+            font-size: 0.85em;
+            color: #6b7280;
+            margin-bottom: 5px;
+        }
+        .log-message { color: #1f2937; }
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .action-btn {
+            padding: 10px 20px;
+            background: #10b981;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .action-btn:hover { background: #059669; }
     </style>
     <script>
-        function refreshData() {
-            fetch('/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('leads-analyzed').textContent = data.metrics.leads_analyzed;
-                    document.getElementById('deals-monitored').textContent = data.metrics.deals_monitored;
-                    document.getElementById('interventions').textContent = data.metrics.interventions_made;
-                    document.getElementById('alerts').textContent = data.metrics.alerts_sent;
+        async function refreshData() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                document.getElementById('leads-analyzed').textContent = data.metrics.leads_analyzed;
+                document.getElementById('deals-monitored').textContent = data.metrics.deals_monitored;
+                document.getElementById('interventions').textContent = data.metrics.interventions_made;
+                document.getElementById('alerts').textContent = data.metrics.alerts_sent;
+                
+                const logContainer = document.getElementById('log-entries');
+                logContainer.innerHTML = data.recent_logs.map(log => {
+                    let cssClass = 'success';
+                    if (log.type.toLowerCase().includes('error')) cssClass = 'error';
+                    if (log.type.toLowerCase().includes('alert')) cssClass = 'warning';
                     
-                    const logContainer = document.getElementById('log-entries');
-                    logContainer.innerHTML = data.recent_logs.map(log => `
-                        <div class="log-entry ${log.type.toLowerCase() === 'error' ? 'error' : 'success'}">
+                    return `
+                        <div class="log-entry ${cssClass}">
                             <div class="log-time">${new Date(log.timestamp).toLocaleString()}</div>
                             <div class="log-message"><strong>${log.type}:</strong> ${log.message}</div>
                         </div>
-                    `).join('');
-                });
+                    `;
+                }).join('');
+            } catch (error) {
+                console.error('Refresh failed:', error);
+            }
         }
         
         async function askAgent() {
@@ -446,10 +620,9 @@ DASHBOARD_HTML = """
                 return;
             }
             
-            // Show loading state
             resultDiv.style.display = 'block';
             resultDiv.classList.add('show');
-            resultDiv.textContent = 'Analyzing your pipeline...';
+            resultDiv.textContent = 'Analyzing your pipeline... This may take 10-15 seconds.';
             button.disabled = true;
             button.textContent = 'Analyzing...';
             
@@ -470,6 +643,39 @@ DASHBOARD_HTML = """
             }
         }
         
+        async function triggerJob(jobName) {
+            try {
+                const response = await fetch(`/api/trigger/${jobName}`, {method: 'POST'});
+                const data = await response.json();
+                alert(data.message);
+                refreshData();
+            } catch (error) {
+                alert('Failed to trigger job: ' + error.message);
+            }
+        }
+        
+        async function generateReport() {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'Generating...';
+            
+            try {
+                const response = await fetch('/api/report/weekly');
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `gtm-report-${new Date().toISOString().split('T')[0]}.txt`;
+                a.click();
+                alert('Report downloaded!');
+            } catch (error) {
+                alert('Report generation failed: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Generate Weekly Report';
+            }
+        }
+        
         setInterval(refreshData, 5000);
         window.onload = refreshData;
     </script>
@@ -477,15 +683,22 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div class="header">
-            <h1>🤖 GTM Autonomous Agent</h1>
-            <div class="status">● ACTIVE & MONITORING</div>
+            <h1>GTM Autonomous Agent v2</h1>
+            <div class="status">ACTIVE & MONITORING</div>
         </div>
         
         <div class="query-section">
             <h2 style="margin-bottom: 15px;">Ask the Agent</h2>
-            <input type="text" id="query-input" class="query-input" placeholder="What should I focus on today?" />
+            <input type="text" id="query-input" class="query-input" placeholder="What should I focus on today? Which deals need attention?" />
             <button class="query-button" onclick="askAgent()">Analyze</button>
-            <div id="query-result" class="query-result" style="display: none;"></div>
+            <button class="action-btn" onclick="generateReport()">Generate Weekly Report</button>
+            <div id="query-result" class="query-result"></div>
+            
+            <div class="action-buttons" style="margin-top: 20px;">
+                <button class="action-btn" onclick="triggerJob('morning_brief')">Run Morning Brief</button>
+                <button class="action-btn" onclick="triggerJob('deal_health')">Check Deal Health</button>
+                <button class="action-btn" onclick="triggerJob('lead_score')">Analyze Lead Scores</button>
+            </div>
         </div>
         
         <div class="grid">
@@ -524,60 +737,258 @@ def dashboard():
 def status():
     return jsonify({
         'metrics': metrics,
-        'recent_logs': agent_log[:20]
+        'recent_logs': agent_log[:30],
+        'status': 'healthy'
     })
 
 @app.route('/api/query', methods=['POST'])
 def query():
+    """Handle manual queries from dashboard"""
     question = request.json.get('question', '')
     
-    # Get current pipeline data
-    contacts = get_hubspot_contacts({'limit': 50})
-    deals = get_hubspot_deals({'limit': 50})
-    
-    # Analyze with Claude
-    answer = analyze_with_claude(
-        f"User question: {question}\n\nProvide actionable insights and recommendations.",
-        {'contacts': contacts[:10], 'deals': deals[:10]}
-    )
+    if not question:
+        return jsonify({'answer': 'Please provide a question'})
     
     log_action('QUERY', f'Manual query: {question[:50]}...', None)
     
-    # Show result
-    result_div = """
-    <script>
-        document.getElementById('query-result').style.display = 'block';
-    </script>
-    """
+    # Get current pipeline data
+    contacts = get_hubspot_contacts(limit=100)
+    deals = get_hubspot_deals(limit=100)
+    
+    # Calculate key metrics
+    pipeline_value = sum([float(d.get('properties', {}).get('amount', 0)) for d in deals if 'closed' not in d.get('properties', {}).get('dealstage', '').lower()])
+    high_score_leads = [c for c in contacts if int(c.get('properties', {}).get('lead_score_ml', 0)) >= 80]
+    
+    # Analyze with Claude
+    answer = analyze_with_claude(
+        f"""You're a GTM analyst. Answer this question based on the current pipeline data: {question}
+        
+Provide specific, actionable insights with concrete numbers and recommendations.""",
+        {
+            'total_contacts': len(contacts),
+            'total_deals': len(deals),
+            'pipeline_value': f'${pipeline_value:,.0f}',
+            'high_score_leads': len(high_score_leads),
+            'contact_samples': contacts[:15],
+            'deal_samples': deals[:15]
+        }
+    )
     
     return jsonify({'answer': answer})
 
+@app.route('/api/trigger/<job_name>', methods=['POST'])
+def trigger_job(job_name):
+    """Manually trigger scheduled jobs"""
+    jobs = {
+        'morning_brief': morning_brief_job,
+        'deal_health': deal_health_check_job,
+        'lead_score': lead_score_optimizer_job,
+        'weekly_report': generate_weekly_report
+    }
+    
+    if job_name not in jobs:
+        return jsonify({'error': 'Invalid job name'}), 400
+    
+    try:
+        # Run job in background
+        jobs[job_name]()
+        return jsonify({'message': f'{job_name} job triggered successfully'})
+    except Exception as e:
+        log_action('ERROR', f'Manual trigger failed for {job_name}: {str(e)}', None)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/report/weekly')
+def weekly_report():
+    """Generate downloadable weekly report"""
+    try:
+        week_ago_ms = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
+        
+        contacts = get_hubspot_contacts(limit=300)
+        deals = get_hubspot_deals(limit=150)
+        
+        weekly_leads = [c for c in contacts if int(c.get('properties', {}).get('createdate', '0')) > week_ago_ms]
+        weekly_closed = [d for d in deals if 'closed' in d.get('properties', {}).get('dealstage', '').lower()]
+        
+        won_deals = [d for d in weekly_closed if 'won' in d.get('properties', {}).get('dealstage', '').lower()]
+        revenue = sum([float(d.get('properties', {}).get('amount', 0)) for d in won_deals])
+        
+        report_content = f"""
+GTM WEEKLY REPORT
+Generated: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}
+Report Period: Last 7 Days
+
+════════════════════════════════════════════════════════════════
+
+EXECUTIVE SUMMARY
+════════════════════════════════════════════════════════════════
+
+New Leads: {len(weekly_leads)}
+Closed Deals: {len(weekly_closed)}
+Won Deals: {len(won_deals)}
+Weekly Revenue: ${revenue:,.2f}
+
+Conversion Rate: {(len(won_deals) / len(weekly_leads) * 100) if weekly_leads else 0:.1f}%
+Average Deal Size: ${(revenue / len(won_deals)) if won_deals else 0:,.2f}
+
+════════════════════════════════════════════════════════════════
+
+TOP PERFORMING LEADS (This Week)
+════════════════════════════════════════════════════════════════
+
+"""
+        
+        # Add top leads
+        top_leads = sorted(weekly_leads, key=lambda x: int(x.get('properties', {}).get('lead_score_ml', 0)), reverse=True)[:10]
+        for i, lead in enumerate(top_leads, 1):
+            props = lead.get('properties', {})
+            report_content += f"{i}. {props.get('firstname', '')} {props.get('lastname', '')} - {props.get('company', 'Unknown')}\n"
+            report_content += f"   Score: {props.get('lead_score_ml', 'N/A')} | Territory: {props.get('territory_assignment', 'N/A')}\n\n"
+        
+        report_content += f"""
+════════════════════════════════════════════════════════════════
+
+CLOSED DEALS (This Week)
+════════════════════════════════════════════════════════════════
+
+"""
+        
+        # Add closed deals
+        for i, deal in enumerate(weekly_closed[:10], 1):
+            props = deal.get('properties', {})
+            report_content += f"{i}. {props.get('dealname', 'Unknown Deal')}\n"
+            report_content += f"   Amount: ${float(props.get('amount', 0)):,.2f} | Stage: {props.get('dealstage', 'Unknown')}\n\n"
+        
+        # Get AI analysis
+        ai_insights = analyze_with_claude(
+            """Provide strategic insights for this weekly performance:
+1. Key trends and patterns
+2. Areas of concern
+3. Opportunities to capitalize on
+4. Specific recommendations for next week""",
+            {
+                'weekly_summary': {
+                    'leads': len(weekly_leads),
+                    'deals': len(weekly_closed),
+                    'revenue': revenue,
+                    'conversion_rate': f"{(len(won_deals) / len(weekly_leads) * 100) if weekly_leads else 0:.1f}%"
+                }
+            }
+        )
+        
+        report_content += f"""
+════════════════════════════════════════════════════════════════
+
+AI STRATEGIC INSIGHTS
+════════════════════════════════════════════════════════════════
+
+{ai_insights}
+
+════════════════════════════════════════════════════════════════
+
+Report generated by GTM Autonomous Agent v2
+For questions or custom reports, contact your RevOps team
+"""
+        
+        log_action('REPORT', 'Weekly report generated', None)
+        
+        return Response(
+            report_content,
+            mimetype='text/plain',
+            headers={'Content-Disposition': f'attachment; filename=gtm-report-{datetime.now().strftime("%Y-%m-%d")}.txt'}
+        )
+        
+    except Exception as e:
+        log_action('ERROR', f'Report generation failed: {str(e)}', None)
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/health')
 def health():
-    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+    """Health check endpoint"""
+    uptime_seconds = (datetime.now() - datetime.fromisoformat(metrics['uptime_start'])).total_seconds()
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'uptime_seconds': uptime_seconds,
+        'anthropic_configured': anthropic_client is not None,
+        'hubspot_configured': bool(HUBSPOT_TOKEN),
+        'slack_configured': bool(SLACK_WEBHOOK_URL)
+    })
 
-# ===== SCHEDULER =====
+# ===== SCHEDULER SETUP =====
 
-scheduler = BackgroundScheduler()
+def start_scheduler():
+    """Initialize and start the job scheduler"""
+    scheduler = BackgroundScheduler()
+    
+    # Morning Brief - 8:00 AM daily
+    scheduler.add_job(
+        morning_brief_job, 
+        'cron', 
+        hour=8, 
+        minute=0, 
+        id='morning_brief',
+        replace_existing=True
+    )
+    
+    # Deal Health Check - Every 4 hours
+    scheduler.add_job(
+        deal_health_check_job, 
+        'interval', 
+        hours=4, 
+        id='deal_health',
+        replace_existing=True
+    )
+    
+    # Lead Score Optimizer - 11:00 PM daily
+    scheduler.add_job(
+        lead_score_optimizer_job, 
+        'cron', 
+        hour=23, 
+        minute=0, 
+        id='lead_score',
+        replace_existing=True
+    )
+    
+    # Weekly Report - Monday 9:00 AM
+    scheduler.add_job(
+        generate_weekly_report,
+        'cron',
+        day_of_week='mon',
+        hour=9,
+        minute=0,
+        id='weekly_report',
+        replace_existing=True
+    )
+    
+    scheduler.start()
+    log_action('STARTUP', 'Scheduler started - all jobs configured', None)
+    
+    return scheduler
 
-# Schedule jobs
-scheduler.add_job(morning_brief_job, 'cron', hour=8, minute=0, id='morning_brief')
-scheduler.add_job(deal_health_check_job, 'interval', hours=4, id='deal_health')
-scheduler.add_job(lead_score_analysis_job, 'cron', hour=23, minute=0, id='lead_score')
-
-scheduler.start()
+# ===== APPLICATION STARTUP =====
 
 if __name__ == '__main__':
-    log_action('STARTUP', '🚀 GTM Autonomous Agent started successfully', None)
-    print("\n" + "="*60)
-    print("GTM AUTONOMOUS AGENT - RUNNING")
-    print("="*60)
+    print("\n" + "="*70)
+    print("GTM AUTONOMOUS AGENT v2 - PRODUCTION")
+    print("="*70)
     print(f"Dashboard: http://localhost:5000")
     print(f"Health Check: http://localhost:5000/health")
     print("\nScheduled Jobs:")
     print("  • Morning Brief: Daily at 8:00 AM")
     print("  • Deal Health Check: Every 4 hours")
-    print("  • Lead Score Analysis: Daily at 11:00 PM")
-    print("="*60 + "\n")
+    print("  • Lead Score Optimizer: Daily at 11:00 PM")
+    print("  • Weekly Report: Monday at 9:00 AM")
+    print("\nConfiguration:")
+    print(f"  • Anthropic: {'✓ Configured' if anthropic_client else '✗ Not configured'}")
+    print(f"  • HubSpot: {'✓ Configured' if HUBSPOT_TOKEN else '✗ Not configured'}")
+    print(f"  • Slack: {'✓ Configured' if SLACK_WEBHOOK_URL else '✗ Not configured'}")
+    print("="*70 + "\n")
     
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    log_action('STARTUP', 'GTM Autonomous Agent v2 started successfully', None)
+    
+    # Start the scheduler
+    scheduler = start_scheduler()
+    
+    # Run Flask app
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
