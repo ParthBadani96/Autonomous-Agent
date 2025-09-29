@@ -103,20 +103,21 @@ def hubspot_request(endpoint, method='GET', data=None, params=None):
         if response.status_code in [200, 201]:
             return response.json()
         else:
-            log_action('ERROR', f'HubSpot {method} {endpoint} failed: {response.status_code}', None)
+            error_text = response.text[:300] if response.text else 'No error details'
+            log_action('ERROR', f'HubSpot {method} {endpoint} - Status {response.status_code}: {error_text}', None)
             return None
     except Exception as e:
-        log_action('ERROR', f'HubSpot request error: {str(e)}', None)
+        log_action('ERROR', f'HubSpot request exception: {str(e)}', None)
         return None
 
 def get_hubspot_contacts(limit=100, properties=None):
-    """Fetch contacts from HubSpot"""
-    props = properties or ['firstname', 'lastname', 'email', 'company', 'lead_score_ml', 
-                           'territory_assignment', 'createdate', 'hs_lead_status']
-    params = {
-        'limit': limit,
-        'properties': ','.join(props)
-    }
+    """Fetch contacts from HubSpot with minimal properties"""
+    params = {'limit': limit}
+    
+    # Only request standard properties
+    if properties:
+        params['properties'] = ','.join(properties)
+    
     result = hubspot_request('/crm/v3/objects/contacts', params=params)
     return result.get('results', []) if result else []
 
@@ -240,12 +241,7 @@ def morning_brief_job():
         
         # Analyze with Claude
         analysis = analyze_with_claude(
-            """You're a GTM analyst providing a morning brief. Analyze these leads and provide:
-1. Total new leads and comparison to average
-2. Top 3 priority leads to focus on today (with reasons)
-3. Key patterns or insights
-4. 3 specific action items for the team
-Keep it concise and actionable.""",
+            """Hey, can you take a look at the leads that came in and help me figure out what we should focus on today? I need to know which leads are worth jumping on right away and if there are any patterns I should know about. Just give me the straight talk - what's hot, what should I prioritize, and any quick action items for the team.""",
             {
                 'new_leads_24h': len(recent_contacts),
                 'recent_leads_sample': recent_contacts[:5],
@@ -373,11 +369,7 @@ def lead_score_optimizer_job():
         closed_won = [d for d in deals if 'closedwon' in d.get('properties', {}).get('dealstage', '').lower()]
         
         analysis = analyze_with_claude(
-            """Analyze lead scoring effectiveness and provide recommendations:
-1. Are high-scoring leads converting well?
-2. Any patterns in closed won deals we should incorporate into scoring?
-3. Recommendations for score adjustments
-4. Specific leads that should have scores updated""",
+            """So I'm looking at our lead scoring and trying to figure out if it's actually working or if we need to tweak it. Can you check if the high-scoring leads are actually converting? Are we missing anything? Just let me know what you think and if there's anything we should adjust.""",
             {
                 'high_score_leads': len(high_score_leads),
                 'high_score_sample': high_score_leads[:10],
@@ -435,12 +427,7 @@ def generate_weekly_report():
         revenue = sum([float(d.get('properties', {}).get('amount', 0)) for d in weekly_closed if 'won' in d.get('properties', {}).get('dealstage', '').lower()])
         
         report = analyze_with_claude(
-            """Generate a comprehensive weekly GTM report including:
-1. Lead generation summary and trends
-2. Deal progression and velocity
-3. Revenue and conversion metrics
-4. Key wins and losses
-5. Strategic recommendations for next week""",
+            """Can you put together a quick summary of how this week went? I need to understand what's working, what's not, and what we should focus on next week. Just talk to me like we're reviewing the week over coffee - what jumped out at you?""",
             {
                 'weekly_leads': len(weekly_leads),
                 'weekly_closed_deals': len(weekly_closed),
@@ -804,9 +791,9 @@ def query():
     
     # Analyze with Claude
     answer = analyze_with_claude(
-        f"""You're a GTM analyst. Answer this question based on the current pipeline data: {question}
+        f"""Hey, someone from the team just asked me: "{question}"
         
-Provide specific, actionable insights with concrete numbers and recommendations.""",
+Can you help me answer this based on what's happening in our pipeline right now? Just talk to me like we're colleagues figuring this out together - give me the real talk on what's going on and what they should do about it.""",
         {
             'total_contacts': len(contacts),
             'total_deals': len(deals),
@@ -917,11 +904,7 @@ CLOSED DEALS (This Week)
         
         # Get AI analysis
         ai_insights = analyze_with_claude(
-            """Provide strategic insights for this weekly performance:
-1. Key trends and patterns
-2. Areas of concern
-3. Opportunities to capitalize on
-4. Specific recommendations for next week""",
+            """Alright, I'm putting together the weekly report and need your take on how things went. What stood out to you? Any red flags I should mention? What should we double down on next week? Just give me your honest thoughts like we're talking shop.""",
             {
                 'weekly_summary': {
                     'leads': len(weekly_leads),
