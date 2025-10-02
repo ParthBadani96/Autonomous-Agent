@@ -57,7 +57,7 @@ def send_slack(message, blocks=None):
     """Send message to Slack with retry logic"""
     try:
         if not SLACK_WEBHOOK_URL or SLACK_WEBHOOK_URL == 'demo-mode':
-            log_action('SLACK', f'Demo mode: {message[:100]}', None)
+            log_action('SLACK', f'📱 Slack demo: {message[:80]}...', None)
             return True
         
         payload = {'text': message}
@@ -67,10 +67,10 @@ def send_slack(message, blocks=None):
         response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
         if response.status_code == 200:
             metrics['alerts_sent'] += 1
-            log_action('SLACK', 'Message sent successfully', None)
+            log_action('SLACK', f'📱 Sent to Slack: {message[:80]}...', None)
             return True
         else:
-            log_action('ERROR', f'Slack failed: {response.status_code}', None)
+            log_action('ERROR', f'Slack notification failed', None)
             return False
     except Exception as e:
         log_action('ERROR', f'Slack error: {str(e)}', None)
@@ -150,7 +150,7 @@ def create_hubspot_task(title, notes, due_date=None, deal_id=None):
         hubspot_request(assoc_url, method='PUT')
         
     if task:
-        log_action('TASK', f'Created: {title}', {'task_id': task.get('id')})
+        log_action('TASK', f'✅ Task created in HubSpot: {title[:50]}...', {'task_id': task.get('id')})
         metrics['interventions_made'] += 1
         
     return task
@@ -255,20 +255,12 @@ def morning_brief_job():
             }
         )
         
-        # Format Slack message
-        blocks = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"Morning Brief - {datetime.now().strftime('%B %d, %Y')}"}
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Pipeline Snapshot*\n• New Leads (24h): {len(recent_contacts)}\n• Open Deals: {len(open_deals)}\n• Pipeline Value: ${pipeline_value:,.0f}\n\n*AI Analysis:*\n{analysis[:800]}"}
-            }
-        ]
-        
-        send_slack(f"Morning Brief: {len(recent_contacts)} new leads, ${pipeline_value:,.0f} pipeline", blocks)
-        log_action('BRIEF', f'Morning brief completed: {len(recent_contacts)} leads, {len(open_deals)} open deals', None)
+        # Friendly log message
+        if recent_contacts:
+            sample_names = ', '.join([f"{c.get('properties', {}).get('firstname', '')} {c.get('properties', {}).get('lastname', '')}" for c in recent_contacts[:3]])
+            log_action('BRIEF', f'📊 Morning brief sent: {len(recent_contacts)} new leads including {sample_names}', None)
+        else:
+            log_action('BRIEF', f'📊 Morning brief sent: No new leads in last 24 hours', None)
         
     except Exception as e:
         log_action('ERROR', f'Morning brief failed: {str(e)}', None)
@@ -338,6 +330,7 @@ DO NOT let this deal go cold. Take action today."""
                 task = create_hubspot_task(task_title, task_notes, due_date, deal['id'])
                 if task:
                     tasks_created += 1
+                    log_action('INTERVENTION', f'🚨 Created urgent task for stalled ${deal["amount"]:,.0f} deal: {deal["name"]}', None)
             
             # Send Slack alert
             alert_text = f"Deal Health Alert: {len(stalled_deals)} stalled deals found"
@@ -788,7 +781,7 @@ def query():
         if not question:
             return jsonify({'answer': 'Please provide a question'})
         
-        log_action('QUERY', f'Manual query: {question[:50]}...', None)
+        log_action('QUERY', f'💬 User asked: "{question[:60]}..."', None)
         
         # Get current pipeline data with error handling
         contacts = []
@@ -796,11 +789,13 @@ def query():
         
         try:
             contacts = get_hubspot_contacts(limit=100, properties=['firstname', 'lastname', 'email', 'company', 'createdate'])
+            log_action('DATA', f'📊 Analyzed {len(contacts)} contacts from HubSpot', None)
         except Exception as e:
             log_action('ERROR', f'Failed to fetch contacts: {str(e)}', None)
         
         try:
             deals = get_hubspot_deals(limit=100)
+            log_action('DATA', f'💼 Checked {len(deals)} deals in pipeline', None)
         except Exception as e:
             log_action('ERROR', f'Failed to fetch deals: {str(e)}', None)
         
